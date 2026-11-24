@@ -137,12 +137,22 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build python3 openjdk-17-jdk \
             xz-utils zip unzip patch pkg-config
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc >/dev/null
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm23.list
-          sudo apt-get update
-          sudo apt-get install -y clang-23 lld-23
-          /usr/lib/llvm-23/bin/clang --dumpversion | tee /tmp/clangver
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key >/dev/null 2>&1 || true
+          # apt.llvm.org 的 llvm-toolchain-noble-23 现在只给 23.1.6，而 build-runtimes.py
+          # 硬校验 `clang -dumpversion` == 23.1.1（见 build-runtimes.py:53），只能用官方产物。
+          mkdir -p "$ROOT/tools"
+          curl -fSL --retry 5 --retry-all-errors -o /tmp/llvm-toolchain.tar.xz \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz
+          echo "832aeb58d105de1cabc7b982dd2c65de0610f7377df48ae8fc2dd8e97420a15c  /tmp/llvm-toolchain.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/llvm-toolchain.tar.xz -C "$ROOT/tools"
+          rm -f /tmp/llvm-toolchain.tar.xz
+          CLANG=$(find "$ROOT/tools" -maxdepth 3 -path '*/bin/clang' | head -1)
+          echo "clang=$CLANG"
+          test -x "$CLANG"
+          test -x "$(dirname "$CLANG")/clang++" || { echo "::error::clang++ 不在 clang 旁边"; exit 1; }
+          "$CLANG" -dumpversion | tee /tmp/clangver
           grep -qx '23.1.1' /tmp/clangver || { echo "::error::需要 clang 23.1.1"; exit 1; }
+          echo "CLANG=$CLANG" >> "$GITHUB_ENV"
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
 
       - name: Host Node 24.22.1 + npm 11.9.0
@@ -197,7 +207,7 @@ jobs:
           set -euo pipefail
           python3 runtime/ohos/node/build-runtimes.py \
             --sdk-native "$ROOT/sdk/native" \
-            --clang /usr/lib/llvm-23/bin/clang \
+            --clang "$CLANG" \
             --source-archive "$ROOT/src/llvm-project-23.1.1.src.tar.xz" \
             --work "$ROOT/llvm-build" \
             --output "$ROOT/runtimes" \
@@ -208,7 +218,7 @@ jobs:
           set -euo pipefail
           /usr/bin/time -v python3 runtime/ohos/node/build-node.py \
             --sdk-native "$ROOT/sdk/native" \
-            --clang /usr/lib/llvm-23/bin/clang \
+            --clang "$CLANG" \
             --cxx-runtime "$ROOT/runtimes" \
             --source-archive "$ROOT/src/node-v24.22.1.tar.xz" \
             --host-node "$ROOT/node/bin/node" \
@@ -239,7 +249,7 @@ jobs:
           set -euo pipefail
           python3 runtime/ohos/native/build-hap-libs.py \
             --sdk-native "$ROOT/sdk/native" \
-            --clang /usr/lib/llvm-23/bin/clang \
+            --clang "$CLANG" \
             --cxx-runtime "$ROOT/runtimes" \
             --libnode-output "$ROOT/node-out" \
             --node-source "$ROOT/src/node-v24.22.1" \
