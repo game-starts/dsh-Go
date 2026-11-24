@@ -1,11 +1,9 @@
-# 云上全流程构建 dsh-Go 的鸿蒙 HAP（无需本机 WSL / 管理员权限）
+# Cloud end-to-end build of the dsh-Go HarmonyOS HAP (no local WSL, no admin rights needed)
 #
-# 放到 fork 的 `.github/workflows/build-hap.yml`，在 `harmonyos` 分支上跑。
-# 两个 job：macos 出 AOT（oh-flutter 只在那有 AOT 工具），ubuntu 出 libnode +
-# 原生库 + 运行时 + unsigned HAP。
-#
-# 预计：macos 5–15 min，ubuntu 90–180 min，磁盘峰值约 30 GB（脚本先清掉 runner
-# 里用不到的 20 GB），产物 dsh-go-unsigned-hap（保留 14 天）。
+# Place at .github/workflows/build-hap.yml on the fork, run it on the harmonyos branch.
+# Two jobs: macos produces the AOT bundle (oh-flutter ships AOT tools only there); ubuntu does
+# libnode + native libs + runtime + unsigned HAP. Expected: macos 5-15 min, ubuntu 90-180 min,
+# disk peak ~30 GB (the job first deletes ~20 GB of unused runner payload). Artifact: 14 days.
 name: Build HAP
 
 on:
@@ -111,7 +109,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # ------------------------------------------------- 2. 原生库 + 运行时 + HAP
+  # ------------------------------------------------- 2. native libs + runtime + HAP
   hap:
     needs: aot
     runs-on: ubuntu-24.04
@@ -138,8 +136,8 @@ jobs:
             build-essential cmake ninja-build python3 openjdk-17-jdk \
             xz-utils zip unzip patch pkg-config
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key >/dev/null 2>&1 || true
-          # apt.llvm.org 的 llvm-toolchain-noble-23 现在只给 23.1.6，而 build-runtimes.py
-          # 硬校验 `clang -dumpversion` == 23.1.1（见 build-runtimes.py:53），只能用官方产物。
+          # apt.llvm.org llvm-toolchain-noble-23 now ships 23.1.6, while build-runtimes.py
+          # hard-checks `clang -dumpversion` == 23.1.1 (build-runtimes.py:53): use the official build.
           mkdir -p "$ROOT/tools"
           curl -fSL --retry 5 --retry-all-errors -o /tmp/llvm-toolchain.tar.xz \
             https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz
@@ -149,9 +147,22 @@ jobs:
           CLANG=$(find "$ROOT/tools" -maxdepth 3 -path '*/bin/clang' | head -1)
           echo "clang=$CLANG"
           test -x "$CLANG"
-          test -x "$(dirname "$CLANG")/clang++" || { echo "::error::clang++ 不在 clang 旁边"; exit 1; }
+          BIN=$(dirname "$CLANG")
+          test -x "$BIN/clang++" || { echo "::error::clang++ is not next to clang"; exit 1; }
+          # The official tarball ships bin/clang as a symlink to clang-23, and build-loader.py
+          # Path.resolve()s it: argv[0] becomes clang-23, the driver falls back to C mode,
+          # -stdlib=libc++ is dropped and no libc++ symbol reaches the link (run4 root cause).
+          # Replace it with a same-named HARD link so resolve() keeps the clang++ name.
+          REAL=$(readlink -f "$CLANG")
+          rm -f "$BIN/clang++"
+          ln "$REAL" "$BIN/clang++"
+          CLANG="$BIN/clang++"
+          test "$(readlink -f "$CLANG")" = "$BIN/clang++" || { echo "::error::clang++ is still a symlink"; exit 1; }
           "$CLANG" -dumpversion | tee /tmp/clangver
-          grep -qx '23.1.1' /tmp/clangver || { echo "::error::需要 clang 23.1.1"; exit 1; }
+          grep -qx '23.1.1' /tmp/clangver || { echo "::error::clang 23.1.1 is required"; exit 1; }
+          printf 'int main(){return 0;}\n' > /tmp/t.cc
+          "$CLANG" --target=aarch64-linux-ohos -stdlib=libc++ -### -o /tmp/t /tmp/t.cc 2>&1 | tee /tmp/linkline
+          grep -q -- '-lc++' /tmp/linkline || echo "::warning::clang++ did not pass -lc++ to the linker; check the driver mode"
           echo "CLANG=$CLANG" >> "$GITHUB_ENV"
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
 
@@ -202,8 +213,9 @@ jobs:
           npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/ohos/node/build-tools
           python3 runtime/tests/ohos/node-build.py --source "$ROOT/src/node-v24.22.1"
 
-      - name: Node toolchain cache
-        uses: actions/cache@v4
+      - name: Node toolchain cache restore
+        id: nodecache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ env.ROOT }}/runtimes
@@ -211,16 +223,17 @@ jobs:
           key: dsh-ohos-libnode-v1
 
       - name: Node toolchain cache probe
-        id: nodecache
+        id: nodecacheprobe
         run: |
-          if [ -f "$ROOT/node-out/build.json" ] && [ -f "$ROOT/runtimes/runtimes.json" ]; then
+          if [ "${{ steps.nodecache.outputs.cache-hit }}" = "true" ] \
+             && [ -f "$ROOT/node-out/build.json" ] && [ -f "$ROOT/runtimes/runtimes.json" ]; then
             echo "hit=true" >> "$GITHUB_OUTPUT"; echo "libnode cache HIT - skipping the rebuild"
           else
             echo "hit=false" >> "$GITHUB_OUTPUT"; echo "libnode cache MISS"
           fi
 
       - name: LLVM runtimes for ohos (clang 23.1.1)
-        if: steps.nodecache.outputs.hit != 'true'
+        if: steps.nodecacheprobe.outputs.hit != 'true'
         run: |
           set -euo pipefail
           python3 runtime/ohos/node/build-runtimes.py \
@@ -232,7 +245,7 @@ jobs:
             --jobs 4
 
       - name: libnode.so
-        if: steps.nodecache.outputs.hit != 'true'
+        if: steps.nodecacheprobe.outputs.hit != 'true'
         run: |
           set -euo pipefail
           /usr/bin/time -v python3 runtime/ohos/node/build-node.py \
@@ -281,7 +294,7 @@ jobs:
             --work "$ROOT/hap-libs-work" \
             --output "$ROOT/hap-libs/arm64-v8a" || status=$?
           if [ "$status" -ne 0 ]; then
-            # 子脚本把编译器 stderr 重定向进了 compile.log，失败时必须把它捞出来
+            # The child redirects compiler stderr into compile.log; surface it on failure.
             for f in "$ROOT"/hap-libs-work/*/compile.log; do
               [ -f "$f" ] || continue
               echo "::group::compile.log ($f)"
@@ -363,6 +376,28 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # actions/cache only saves in a post step that runs on success (post-if: success()),
+      # so save explicitly with always(): the realistic failures happen late in the job.
+      - name: Cache readiness
+        id: cacheready
+        if: always()
+        run: |
+          if [ -f "$ROOT/node-out/build.json" ] && [ -f "$ROOT/runtimes/runtimes.json" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save node toolchain cache
+        if: always() && steps.nodecacheprobe.outputs.hit != 'true' && steps.cacheready.outputs.ok == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.ROOT }}/runtimes
+            ${{ env.ROOT }}/node-out
+          key: dsh-ohos-libnode-v1
+
       - name: Keep the build logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -373,6 +408,10 @@ jobs:
             ${{ env.ROOT }}/arkts/*.txt
             ${{ env.ROOT }}/arkts/hvigor.log
             ${{ env.ROOT }}/hap-libs/audit.json
+            ${{ env.ROOT }}/hap-libs-work/**/compile.log
             ${{ env.ROOT }}/runtime-out/*.json
+            ${{ env.ROOT }}/node-out/build.json
+            ${{ env.ROOT }}/runtimes/runtimes.json
+            ${{ env.ROOT }}/prepared/*.json
           if-no-files-found: warn
           retention-days: 14
