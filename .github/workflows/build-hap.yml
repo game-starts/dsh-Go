@@ -114,7 +114,7 @@ jobs:
   # ------------------------------------------------- 2. 原生库 + 运行时 + HAP
   hap:
     needs: aot
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
