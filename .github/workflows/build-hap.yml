@@ -1,1 +1,417 @@
-﻿# Cloud end-to-end build of the dsh-Go HarmonyOS HAP (no local WSL, no admin rights needed)## Place at .github/workflows/build-hap.yml on the fork, run it on the harmonyos branch.# Two jobs: macos produces the AOT bundle (oh-flutter ships AOT tools only there); ubuntu does# libnode + native libs + runtime + unsigned HAP. Expected: macos 5-15 min, ubuntu 90-180 min,# disk peak ~30 GB (the job first deletes ~20 GB of unused runner payload). Artifact: 14 days.name: Build HAPon:  workflow_dispatch:permissions:  contents: readconcurrency:  group: build-hap-${{ github.ref }}  cancel-in-progress: falseenv:  FLUTTER_OHOS_TAG: 3.47.9-ohos-1.0.0  FLUTTER_OHOS_COMMIT: e5f752df3e25ec897da3c98a74bcced7c21b0bd3  ROOT: /home/runner/dshjobs:  # ---------------------------------------------------------------- 1. Dart AOT  aot:    runs-on: macos-latest    timeout-minutes: 60    steps:      - uses: actions/checkout@v4        with:          persist-credentials: false      - name: Restore oh-flutter        id: sdk        uses: actions/cache/restore@v4        with:          path: ~/flutter-ohos          key: flutter-ohos-${{ env.FLUTTER_OHOS_COMMIT }}-${{ hashFiles('tooling/ohos/patch_framework.py') }}      - name: Install oh-flutter        if: steps.sdk.outputs.cache-hit != 'true'        run: |          for attempt in 1 2 3 4 5; do            rm -rf ~/flutter-ohos            git clone --depth 1 --branch "$FLUTTER_OHOS_TAG" https://atomgit.com/oh-flutter/flutter_flutter.git ~/flutter-ohos && break            [ "$attempt" = 5 ] && exit 1            sleep 60          done      - name: Put oh-flutter on the path        run: |          test "$(git -C ~/flutter-ohos rev-parse HEAD)" = "$FLUTTER_OHOS_COMMIT"          echo "$HOME/flutter-ohos/bin" >> "$GITHUB_PATH"      - name: Patch the framework's HarmonyOS branches        run: python3 tooling/ohos/patch_framework.py ~/flutter-ohos      - name: Fetch the SDK's own tools        run: |          flutter --version          for attempt in 1 2 3 4 5; do            flutter precache --ohos && break            [ "$attempt" = 5 ] && exit 1            sleep 60          done      - name: Save oh-flutter        if: steps.sdk.outputs.cache-hit != 'true'        uses: actions/cache/save@v4        with:          path: ~/flutter-ohos          key: ${{ steps.sdk.outputs.cache-primary-key }}      - name: Resolve dependencies with the OHOS plugins        working-directory: app        run: |          get() {            for attempt in 1 2 3; do              dart pub get && return              [ "$attempt" = 3 ] && return 1              sleep 20            done          }          cp ohos/pubspec_overrides.ohos.yaml pubspec_overrides.yaml          get          python3 ../tooling/ohos/vendor_platform_switches.py          get      - name: Compile to libapp.so        working-directory: app        run: |          flutter assemble \            -dTargetPlatform=ohos-arm64 \            -dBuildMode=release \            -dTargetFile=lib/main.dart \            -dTreeShakeIcons=false \            -dDartDefines=RU5BQkxFX0ZMRVhfT1ZFUkZMT1c9ZmFsc2U= \            --output=build/ohos-aot \            ohos_aot_bundle_release_ohos-arm64          find build/ohos-aot -maxdepth 2 | head -20          wc -c "$(find build/ohos-aot -name app.so | head -1)"      - name: Keep the compiled app        uses: actions/upload-artifact@v4        with:          name: ohos-aot-${{ github.sha }}          path: app/build/ohos-aot          if-no-files-found: error          retention-days: 14  # ------------------------------------------------- 2. native libs + runtime + HAP  hap:    needs: aot    runs-on: ubuntu-24.04    timeout-minutes: 350    steps:      - uses: actions/checkout@v4        with:          persist-credentials: false      - name: Free disk space        run: |          set -x          df -h /          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \                      /usr/share/swift /usr/local/graalvm || true          sudo apt-get clean          df -h /      - name: Install build dependencies        run: |          sudo apt-get update          sudo apt-get install -y --no-install-recommends \            build-essential cmake ninja-build python3 openjdk-17-jdk \            xz-utils zip unzip patch pkg-config          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key >/dev/null 2>&1 || true          # apt.llvm.org llvm-toolchain-noble-23 now ships 23.1.6, while build-runtimes.py          # hard-checks `clang -dumpversion` == 23.1.1 (build-runtimes.py:53): use the official build.          mkdir -p "$ROOT/tools"          curl -fSL --retry 5 --retry-all-errors -o /tmp/llvm-toolchain.tar.xz \            https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz          echo "832aeb58d105de1cabc7b982dd2c65de0610f7377df48ae8fc2dd8e97420a15c  /tmp/llvm-toolchain.tar.xz" | sha256sum -c -          tar -xJf /tmp/llvm-toolchain.tar.xz -C "$ROOT/tools"          rm -f /tmp/llvm-toolchain.tar.xz          CLANG=$(find "$ROOT/tools" -maxdepth 3 -path '*/bin/clang' | head -1)          echo "clang=$CLANG"          test -x "$CLANG"          BIN=$(dirname "$CLANG")          test -x "$BIN/clang++" || { echo "::error::clang++ is not next to clang"; exit 1; }          # The official tarball ships bin/clang as a symlink to clang-23, and build-loader.py          # Path.resolve()s it: argv[0] becomes clang-23, the driver falls back to C mode,          # -stdlib=libc++ is dropped and no libc++ symbol reaches the link (run4 root cause).          # Replace it with a same-named HARD link so resolve() keeps the clang++ name.          REAL=$(readlink -f "$CLANG")          rm -f "$BIN/clang++"          ln "$REAL" "$BIN/clang++"          CLANG="$BIN/clang++"          test "$(readlink -f "$CLANG")" = "$BIN/clang++" || { echo "::error::clang++ is still a symlink"; exit 1; }          "$CLANG" -dumpversion | tee /tmp/clangver          grep -qx '23.1.1' /tmp/clangver || { echo "::error::clang 23.1.1 is required"; exit 1; }          printf 'int main(){return 0;}\n' > /tmp/t.cc          "$CLANG" --target=aarch64-linux-ohos -stdlib=libc++ -### -o /tmp/t /tmp/t.cc 2>&1 | tee /tmp/linkline          grep -q -- '-lc++' /tmp/linkline || echo "::warning::clang++ did not pass -lc++ to the linker; check the driver mode"          echo "CLANG=$CLANG" >> "$GITHUB_ENV"          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"      - name: Host Node 24.22.1 + npm 11.9.0        run: |          set -euo pipefail          mkdir -p "$ROOT"          curl -fsSL --retry 5 -o /tmp/node.tar.xz https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz          tar -xJf /tmp/node.tar.xz -C "$ROOT"          mv "$ROOT/node-v24.22.1-linux-x64" "$ROOT/node"          export PATH="$ROOT/node/bin:$PATH"          npm i -g npm@11.9.0          node --version          npm --version          test "$(npm --version)" = "11.9.0"          echo "$ROOT/node/bin" >> "$GITHUB_PATH"      - name: OpenHarmony SDK 26.0.0.38        run: |          set -euo pipefail          mkdir -p "$ROOT/sdk-src" "$ROOT/sdk"          curl -fSL --retry 5 --retry-all-errors -o /tmp/ohos-sdk.tar.gz \            https://repo.huaweicloud.com/openharmony/os/7.0-Release/ohos-sdk-windows_linux-public.tar.gz          tar -xzf /tmp/ohos-sdk.tar.gz -C "$ROOT/sdk-src" --wildcards '*/linux/*'          for z in "$ROOT"/sdk-src/ohos-sdk/linux/{ets,js,native,toolchains}-linux-x64-*.zip; do            echo "unzip $(basename "$z")"; unzip -q -o "$z" -d "$ROOT/sdk"          done          for d in ets js native toolchains; do            python3 -c "import json,sys;j=json.load(open('$ROOT/sdk/$d/oh-uni-package.json'));assert j['apiVersion'] in ('26',26),j;print('$d',j['version'])"          done          test -x "$ROOT/sdk/toolchains/hdc"          test -f "$ROOT/sdk/toolchains/lib/hap-sign-tool.jar"      - name: Sources (pinned)        run: |          set -euo pipefail          mkdir -p "$ROOT/src" && cd "$ROOT/src"          curl -fSL --retry 5 --retry-all-errors -o node-v24.22.1.tar.xz https://nodejs.org/dist/v24.22.1/node-v24.22.1.tar.xz          curl -fSL --retry 5 --retry-all-errors -o llvm-project-23.1.1.src.tar.xz \            https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/llvm-project-23.1.1.src.tar.xz          echo "4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231  node-v24.22.1.tar.xz" | sha256sum -c -          echo "ebe9be46fe8756d58c5b198ffad0fa2a766257add81a4dc52179bfacc7888ee6  llvm-project-23.1.1.src.tar.xz" | sha256sum -c -          tar xf node-v24.22.1.tar.xz      - name: Pinned Node patches (pre-flight)        run: |          set -euo pipefail          npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/ohos/node/build-tools          python3 runtime/tests/ohos/node-build.py --source "$ROOT/src/node-v24.22.1"      - name: Node toolchain cache restore        id: nodecache        uses: actions/cache/restore@v4        with:          path: |            ${{ env.ROOT }}/runtimes            ${{ env.ROOT }}/node-out          key: dsh-ohos-libnode-v1      - name: Node toolchain cache probe        id: nodecacheprobe        run: |          if [ "${{ steps.nodecache.outputs.cache-hit }}" = "true" ] \             && [ -f "$ROOT/node-out/build.json" ] && [ -f "$ROOT/runtimes/runtimes.json" ]; then            echo "hit=true" >> "$GITHUB_OUTPUT"; echo "libnode cache HIT - skipping the rebuild"          else            echo "hit=false" >> "$GITHUB_OUTPUT"; echo "libnode cache MISS"          fi      - name: LLVM runtimes for ohos (clang 23.1.1)        if: steps.nodecacheprobe.outputs.hit != 'true'        run: |          set -euo pipefail          python3 runtime/ohos/node/build-runtimes.py \            --sdk-native "$ROOT/sdk/native" \            --clang "$CLANG" \            --source-archive "$ROOT/src/llvm-project-23.1.1.src.tar.xz" \            --work "$ROOT/llvm-build" \            --output "$ROOT/runtimes" \            --jobs 4      - name: libnode.so        if: steps.nodecacheprobe.outputs.hit != 'true'        run: |          set -euo pipefail          /usr/bin/time -v python3 runtime/ohos/node/build-node.py \            --sdk-native "$ROOT/sdk/native" \            --clang "$CLANG" \            --cxx-runtime "$ROOT/runtimes" \            --source-archive "$ROOT/src/node-v24.22.1.tar.xz" \            --host-node "$ROOT/node/bin/node" \            --work "$ROOT/node-build" \            --output "$ROOT/node-out" \            --jobs 4          ls -l "$ROOT/node-out"      - name: Third-party inputs        run: |          set -euo pipefail          mkdir -p "$ROOT/pkg" && cd "$ROOT/pkg"          npm pack @deepseek-ai/node-addon-system@0.1.2          tar xf deepseek-ai-node-addon-system-0.1.2.tgz && mv package node-addon-system-0.1.2          npm pack node-addon-api@8.9.2          tar xf node-addon-api-8.9.2.tgz && mv package node-addon-api-8.9.2          curl -fSL --retry 5 -o require-builtin.tar.gz \            https://codeload.github.com/deepseek-ai/dsh-node-addon-require-builtin/tar.gz/a58d3599a2e551d7d706d1ff796c9fd4bbaff63c          mkdir -p require-builtin && tar xf require-builtin.tar.gz -C require-builtin --strip-components=1          curl -fSL --retry 5 -o sqlite-amalgamation-3540100.zip https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip          echo "0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9  sqlite-amalgamation-3540100.zip" | sha256sum -c -          unzip -q sqlite-amalgamation-3540100.zip          curl -fSL --retry 5 -o sqlite3-3.9.1.tar.gz https://pub.dev/api/archives/sqlite3-3.9.1.tar.gz          mkdir -p sqlite3-3.9.1 && tar xf sqlite3-3.9.1.tar.gz -C sqlite3-3.9.1      - name: Native libraries (arm64-v8a)        run: |          set -uo pipefail          status=0          python3 runtime/ohos/native/build-hap-libs.py \            --sdk-native "$ROOT/sdk/native" \            --clang "$CLANG" \            --cxx-runtime "$ROOT/runtimes" \            --libnode-output "$ROOT/node-out" \            --node-source "$ROOT/src/node-v24.22.1" \            --flock-package "$ROOT/pkg/node-addon-system-0.1.2" \            --loader-source "$ROOT/pkg/require-builtin" \            --node-addon-api "$ROOT/pkg/node-addon-api-8.9.2" \            --sqlite-amalgamation "$ROOT/pkg/sqlite-amalgamation-3540100.zip" \            --sqlite3-package "$ROOT/pkg/sqlite3-3.9.1" \            --work "$ROOT/hap-libs-work" \            --output "$ROOT/hap-libs/arm64-v8a" || status=$?          if [ "$status" -ne 0 ]; then            # The child redirects compiler stderr into compile.log; surface it on failure.            for f in "$ROOT"/hap-libs-work/*/compile.log; do              [ -f "$f" ] || continue              echo "::group::compile.log ($f)"              tail -n 150 "$f"              echo "::endgroup::"            done            echo "=== audit.json ==="            cat "$ROOT/hap-libs/audit.json" || true            exit "$status"          fi          ls -l "$ROOT/hap-libs/arm64-v8a"          cat "$ROOT/hap-libs/audit.json" || true      - name: Runtime archive        run: |          set -euo pipefail          python3 -I -B runtime/ohos/package/prepare-inputs.py \            --target ohos \            --node "$ROOT/node/bin/node" \            --npm "$ROOT/node/bin/npm" \            --cache "$ROOT/npm-cache" \            --out "$ROOT/prepared"          export NODE_PATH="$ROOT/prepared/process/node_modules"          node runtime/ohos/process/build-rg-regex.mjs "$PWD/runtime/ohos/node/build-tools"          test -f runtime/ohos/process/build/re2js-unicode.mjs          wc -c runtime/ohos/process/build/re2js-unicode.mjs          python3 -I -B runtime/ohos/package/compose-runtime.py \            --target ohos \            --dsh-prefix "$ROOT/prepared/dsh" \            --process-prefix "$ROOT/prepared/process" \            --target-report "$ROOT/prepared/target-report.json" \            --prepared-inputs "$ROOT/prepared/prepared-inputs.json" \            --regex-artifact runtime/ohos/process/build/re2js-unicode.mjs \            --esbuild-prefix "$PWD/runtime/ohos/node/build-tools" \            --imports-report "$ROOT/imports-report.json" \            --node "$ROOT/node/bin/node" \            --runtime-core app/ohos/entry/src/main/ets/runtime/RuntimeCore.ets \            --out "$ROOT/runtime-out"          ls -l "$ROOT/runtime-out"      - name: Download the AOT artifact        uses: actions/download-artifact@v4        with:          name: ohos-aot-${{ github.sha }}          path: ${{ env.ROOT }}/aot      - name: Package the HAP        run: |          set -euo pipefail          AOT="$ROOT/aot"          if [ ! -d "$AOT/arm64-v8a" ]; then            so="$(find "$ROOT/aot" -name app.so | head -1)"            test -n "$so"            AOT="$(dirname "$(dirname "$so")")"          fi          echo "AOT=$AOT"; ls -l "$AOT" "$AOT/arm64-v8a"          bash tooling/ohos/check-arkts.sh \            --sdk "$ROOT/sdk" \            --hms-stubs \            --full \            --aot "$AOT" \            --native "$ROOT/hap-libs/arm64-v8a" \            --runtime "$ROOT/runtime-out/dsh-runtime-rawfile.zip" \            --node-headers "$ROOT/src/node-v24.22.1/src" \            --work "$ROOT/arkts"          hap="$(find "$ROOT/arkts" -name 'entry-default-unsigned.hap' | head -1)"          test -n "$hap"          mkdir -p "$ROOT/out" && cp "$hap" "$ROOT/out/dsh-go-unsigned.hap"          ls -l "$ROOT/out"          cat "$ROOT/arkts/hap-audit.json" || true          echo "## HAP" >> "$GITHUB_STEP_SUMMARY"          echo "dsh-go-unsigned.hap: $(wc -c < "$ROOT/out/dsh-go-unsigned.hap") bytes" >> "$GITHUB_STEP_SUMMARY"      - name: Keep the HAP        uses: actions/upload-artifact@v4        with:          name: dsh-go-unsigned-hap          path: ${{ env.ROOT }}/out/dsh-go-unsigned.hap          if-no-files-found: error          retention-days: 14      # actions/cache only saves in a post step that runs on success (post-if: success()),      # so save explicitly with always(): the realistic failures happen late in the job.      - name: Cache readiness        id: cacheready        if: always()        run: |          if [ -f "$ROOT/node-out/build.json" ] && [ -f "$ROOT/runtimes/runtimes.json" ]; then            echo "ok=true" >> "$GITHUB_OUTPUT"          else            echo "ok=false" >> "$GITHUB_OUTPUT"          fi      - name: Save node toolchain cache        if: always() && steps.nodecacheprobe.outputs.hit != 'true' && steps.cacheready.outputs.ok == 'true'        continue-on-error: true        uses: actions/cache/save@v4        with:          path: |            ${{ env.ROOT }}/runtimes            ${{ env.ROOT }}/node-out          key: dsh-ohos-libnode-v1      - name: Keep the build logs        if: always()        uses: actions/upload-artifact@v4        with:          name: build-logs          path: |            ${{ env.ROOT }}/arkts/*.json            ${{ env.ROOT }}/arkts/*.txt            ${{ env.ROOT }}/arkts/hvigor.log            ${{ env.ROOT }}/hap-libs/audit.json            ${{ env.ROOT }}/hap-libs-work/**/compile.log            ${{ env.ROOT }}/runtime-out/*.json            ${{ env.ROOT }}/node-out/build.json            ${{ env.ROOT }}/runtimes/runtimes.json            ${{ env.ROOT }}/prepared/*.json          if-no-files-found: warn          retention-days: 14
+# Cloud end-to-end build of the dsh-Go HarmonyOS HAP (no local WSL, no admin rights needed)
+#
+# Place at .github/workflows/build-hap.yml on the fork, run it on the harmonyos branch.
+# Two jobs: macos produces the AOT bundle (oh-flutter ships AOT tools only there); ubuntu does
+# libnode + native libs + runtime + unsigned HAP. Expected: macos 5-15 min, ubuntu 90-180 min,
+# disk peak ~30 GB (the job first deletes ~20 GB of unused runner payload). Artifact: 14 days.
+name: Build HAP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-hap-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_OHOS_TAG: 3.47.9-ohos-1.0.0
+  FLUTTER_OHOS_COMMIT: e5f752df3e25ec897da3c98a74bcced7c21b0bd3
+  ROOT: /home/runner/dsh
+
+jobs:
+  # ---------------------------------------------------------------- 1. Dart AOT
+  aot:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Restore oh-flutter
+        id: sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/flutter-ohos
+          key: flutter-ohos-${{ env.FLUTTER_OHOS_COMMIT }}-${{ hashFiles('tooling/ohos/patch_framework.py') }}
+
+      - name: Install oh-flutter
+        if: steps.sdk.outputs.cache-hit != 'true'
+        run: |
+          for attempt in 1 2 3 4 5; do
+            rm -rf ~/flutter-ohos
+            git clone --depth 1 --branch "$FLUTTER_OHOS_TAG" https://atomgit.com/oh-flutter/flutter_flutter.git ~/flutter-ohos && break
+            [ "$attempt" = 5 ] && exit 1
+            sleep 60
+          done
+
+      - name: Put oh-flutter on the path
+        run: |
+          test "$(git -C ~/flutter-ohos rev-parse HEAD)" = "$FLUTTER_OHOS_COMMIT"
+          echo "$HOME/flutter-ohos/bin" >> "$GITHUB_PATH"
+
+      - name: Patch the framework's HarmonyOS branches
+        run: python3 tooling/ohos/patch_framework.py ~/flutter-ohos
+
+      - name: Fetch the SDK's own tools
+        run: |
+          flutter --version
+          for attempt in 1 2 3 4 5; do
+            flutter precache --ohos && break
+            [ "$attempt" = 5 ] && exit 1
+            sleep 60
+          done
+
+      - name: Save oh-flutter
+        if: steps.sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/flutter-ohos
+          key: ${{ steps.sdk.outputs.cache-primary-key }}
+
+      - name: Resolve dependencies with the OHOS plugins
+        working-directory: app
+        run: |
+          get() {
+            for attempt in 1 2 3; do
+              dart pub get && return
+              [ "$attempt" = 3 ] && return 1
+              sleep 20
+            done
+          }
+          cp ohos/pubspec_overrides.ohos.yaml pubspec_overrides.yaml
+          get
+          python3 ../tooling/ohos/vendor_platform_switches.py
+          get
+
+      - name: Compile to libapp.so
+        working-directory: app
+        run: |
+          flutter assemble \
+            -dTargetPlatform=ohos-arm64 \
+            -dBuildMode=release \
+            -dTargetFile=lib/main.dart \
+            -dTreeShakeIcons=false \
+            -dDartDefines=RU5BQkxFX0ZMRVhfT1ZFUkZMT1c9ZmFsc2U= \
+            --output=build/ohos-aot \
+            ohos_aot_bundle_release_ohos-arm64
+          find build/ohos-aot -maxdepth 2 | head -20
+          wc -c "$(find build/ohos-aot -name app.so | head -1)"
+
+      - name: Keep the compiled app
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-aot-${{ github.sha }}
+          path: app/build/ohos-aot
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------- 2. native libs + runtime + HAP
+  hap:
+    needs: aot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+                      /usr/share/swift /usr/local/graalvm || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 openjdk-17-jdk \
+            xz-utils zip unzip patch pkg-config
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key >/dev/null 2>&1 || true
+          # apt.llvm.org llvm-toolchain-noble-23 now ships 23.1.6, while build-runtimes.py
+          # hard-checks `clang -dumpversion` == 23.1.1 (build-runtimes.py:53): use the official build.
+          mkdir -p "$ROOT/tools"
+          curl -fSL --retry 5 --retry-all-errors -o /tmp/llvm-toolchain.tar.xz \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz
+          echo "832aeb58d105de1cabc7b982dd2c65de0610f7377df48ae8fc2dd8e97420a15c  /tmp/llvm-toolchain.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/llvm-toolchain.tar.xz -C "$ROOT/tools"
+          rm -f /tmp/llvm-toolchain.tar.xz
+          CLANG=$(find "$ROOT/tools" -maxdepth 3 -path '*/bin/clang' | head -1)
+          echo "clang=$CLANG"
+          test -x "$CLANG"
+          BIN=$(dirname "$CLANG")
+          test -x "$BIN/clang++" || { echo "::error::clang++ is not next to clang"; exit 1; }
+          # The official tarball ships bin/clang as a symlink to clang-23, and build-loader.py
+          # Path.resolve()s it: argv[0] becomes clang-23, the driver falls back to C mode,
+          # -stdlib=libc++ is dropped and no libc++ symbol reaches the link (run4 root cause).
+          # Replace it with a same-named HARD link so resolve() keeps the clang++ name.
+          REAL=$(readlink -f "$CLANG")
+          rm -f "$BIN/clang++"
+          ln "$REAL" "$BIN/clang++"
+          CLANG="$BIN/clang++"
+          test "$(readlink -f "$CLANG")" = "$BIN/clang++" || { echo "::error::clang++ is still a symlink"; exit 1; }
+          "$CLANG" -dumpversion | tee /tmp/clangver
+          grep -qx '23.1.1' /tmp/clangver || { echo "::error::clang 23.1.1 is required"; exit 1; }
+          printf 'int main(){return 0;}\n' > /tmp/t.cc
+          "$CLANG" --target=aarch64-linux-ohos -stdlib=libc++ -### -o /tmp/t /tmp/t.cc 2>&1 | tee /tmp/linkline
+          grep -q -- '-lc++' /tmp/linkline || echo "::warning::clang++ did not pass -lc++ to the linker; check the driver mode"
+          echo "CLANG=$CLANG" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+
+      - name: Host Node 24.22.1 + npm 11.9.0
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROOT"
+          curl -fsSL --retry 5 -o /tmp/node.tar.xz https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz
+          tar -xJf /tmp/node.tar.xz -C "$ROOT"
+          mv "$ROOT/node-v24.22.1-linux-x64" "$ROOT/node"
+          export PATH="$ROOT/node/bin:$PATH"
+          npm i -g npm@11.9.0
+          node --version
+          npm --version
+          test "$(npm --version)" = "11.9.0"
+          echo "$ROOT/node/bin" >> "$GITHUB_PATH"
+
+      - name: OpenHarmony SDK 26.0.0.38
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROOT/sdk-src" "$ROOT/sdk"
+          curl -fSL --retry 5 --retry-all-errors -o /tmp/ohos-sdk.tar.gz \
+            https://repo.huaweicloud.com/openharmony/os/7.0-Release/ohos-sdk-windows_linux-public.tar.gz
+          tar -xzf /tmp/ohos-sdk.tar.gz -C "$ROOT/sdk-src" --wildcards '*/linux/*'
+          for z in "$ROOT"/sdk-src/ohos-sdk/linux/{ets,js,native,toolchains}-linux-x64-*.zip; do
+            echo "unzip $(basename "$z")"; unzip -q -o "$z" -d "$ROOT/sdk"
+          done
+          for d in ets js native toolchains; do
+            python3 -c "import json,sys;j=json.load(open('$ROOT/sdk/$d/oh-uni-package.json'));assert j['apiVersion'] in ('26',26),j;print('$d',j['version'])"
+          done
+          test -x "$ROOT/sdk/toolchains/hdc"
+          test -f "$ROOT/sdk/toolchains/lib/hap-sign-tool.jar"
+
+      - name: Sources (pinned)
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROOT/src" && cd "$ROOT/src"
+          curl -fSL --retry 5 --retry-all-errors -o node-v24.22.1.tar.xz https://nodejs.org/dist/v24.22.1/node-v24.22.1.tar.xz
+          curl -fSL --retry 5 --retry-all-errors -o llvm-project-23.1.1.src.tar.xz \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/llvm-project-23.1.1.src.tar.xz
+          echo "4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231  node-v24.22.1.tar.xz" | sha256sum -c -
+          echo "ebe9be46fe8756d58c5b198ffad0fa2a766257add81a4dc52179bfacc7888ee6  llvm-project-23.1.1.src.tar.xz" | sha256sum -c -
+          tar xf node-v24.22.1.tar.xz
+
+      - name: Pinned Node patches (pre-flight)
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/ohos/node/build-tools
+          python3 runtime/tests/ohos/node-build.py --source "$ROOT/src/node-v24.22.1"
+
+      - name: Node toolchain cache restore
+        id: nodecache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.ROOT }}/runtimes
+            ${{ env.ROOT }}/node-out
+          key: dsh-ohos-libnode-v1
+
+      - name: Node toolchain cache probe
+        id: nodecacheprobe
+        run: |
+          if [ "${{ steps.nodecache.outputs.cache-hit }}" = "true" ] \
+             && [ -f "$ROOT/node-out/build.json" ] && [ -f "$ROOT/runtimes/runtimes.json" ]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"; echo "libnode cache HIT - skipping the rebuild"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"; echo "libnode cache MISS"
+          fi
+
+      - name: LLVM runtimes for ohos (clang 23.1.1)
+        if: steps.nodecacheprobe.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          python3 runtime/ohos/node/build-runtimes.py \
+            --sdk-native "$ROOT/sdk/native" \
+            --clang "$CLANG" \
+            --source-archive "$ROOT/src/llvm-project-23.1.1.src.tar.xz" \
+            --work "$ROOT/llvm-build" \
+            --output "$ROOT/runtimes" \
+            --jobs 4
+
+      - name: libnode.so
+        if: steps.nodecacheprobe.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v python3 runtime/ohos/node/build-node.py \
+            --sdk-native "$ROOT/sdk/native" \
+            --clang "$CLANG" \
+            --cxx-runtime "$ROOT/runtimes" \
+            --source-archive "$ROOT/src/node-v24.22.1.tar.xz" \
+            --host-node "$ROOT/node/bin/node" \
+            --work "$ROOT/node-build" \
+            --output "$ROOT/node-out" \
+            --jobs 4
+          ls -l "$ROOT/node-out"
+
+      - name: Third-party inputs
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROOT/pkg" && cd "$ROOT/pkg"
+          npm pack @deepseek-ai/node-addon-system@0.1.2
+          tar xf deepseek-ai-node-addon-system-0.1.2.tgz && mv package node-addon-system-0.1.2
+          npm pack node-addon-api@8.9.2
+          tar xf node-addon-api-8.9.2.tgz && mv package node-addon-api-8.9.2
+          curl -fSL --retry 5 -o require-builtin.tar.gz \
+            https://codeload.github.com/deepseek-ai/dsh-node-addon-require-builtin/tar.gz/a58d3599a2e551d7d706d1ff796c9fd4bbaff63c
+          mkdir -p require-builtin && tar xf require-builtin.tar.gz -C require-builtin --strip-components=1
+          curl -fSL --retry 5 -o sqlite-amalgamation-3540100.zip https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip
+          echo "0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9  sqlite-amalgamation-3540100.zip" | sha256sum -c -
+          unzip -q sqlite-amalgamation-3540100.zip
+          curl -fSL --retry 5 -o sqlite3-3.9.1.tar.gz https://pub.dev/api/archives/sqlite3-3.9.1.tar.gz
+          mkdir -p sqlite3-3.9.1 && tar xf sqlite3-3.9.1.tar.gz -C sqlite3-3.9.1
+
+      - name: Native libraries (arm64-v8a)
+        run: |
+          set -uo pipefail
+          status=0
+          python3 runtime/ohos/native/build-hap-libs.py \
+            --sdk-native "$ROOT/sdk/native" \
+            --clang "$CLANG" \
+            --cxx-runtime "$ROOT/runtimes" \
+            --libnode-output "$ROOT/node-out" \
+            --node-source "$ROOT/src/node-v24.22.1" \
+            --flock-package "$ROOT/pkg/node-addon-system-0.1.2" \
+            --loader-source "$ROOT/pkg/require-builtin" \
+            --node-addon-api "$ROOT/pkg/node-addon-api-8.9.2" \
+            --sqlite-amalgamation "$ROOT/pkg/sqlite-amalgamation-3540100.zip" \
+            --sqlite3-package "$ROOT/pkg/sqlite3-3.9.1" \
+            --work "$ROOT/hap-libs-work" \
+            --output "$ROOT/hap-libs/arm64-v8a" || status=$?
+          if [ "$status" -ne 0 ]; then
+            # The child redirects compiler stderr into compile.log; surface it on failure.
+            for f in "$ROOT"/hap-libs-work/*/compile.log; do
+              [ -f "$f" ] || continue
+              echo "::group::compile.log ($f)"
+              tail -n 150 "$f"
+              echo "::endgroup::"
+            done
+            echo "=== audit.json ==="
+            cat "$ROOT/hap-libs/audit.json" || true
+            exit "$status"
+          fi
+          ls -l "$ROOT/hap-libs/arm64-v8a"
+          cat "$ROOT/hap-libs/audit.json" || true
+
+      - name: Runtime archive
+        run: |
+          set -euo pipefail
+          python3 -I -B runtime/ohos/package/prepare-inputs.py \
+            --target ohos \
+            --node "$ROOT/node/bin/node" \
+            --npm "$ROOT/node/bin/npm" \
+            --cache "$ROOT/npm-cache" \
+            --out "$ROOT/prepared"
+          export NODE_PATH="$ROOT/prepared/process/node_modules"
+          node runtime/ohos/process/build-rg-regex.mjs "$PWD/runtime/ohos/node/build-tools"
+          test -f runtime/ohos/process/build/re2js-unicode.mjs
+          wc -c runtime/ohos/process/build/re2js-unicode.mjs
+          python3 -I -B runtime/ohos/package/compose-runtime.py \
+            --target ohos \
+            --dsh-prefix "$ROOT/prepared/dsh" \
+            --process-prefix "$ROOT/prepared/process" \
+            --target-report "$ROOT/prepared/target-report.json" \
+            --prepared-inputs "$ROOT/prepared/prepared-inputs.json" \
+            --regex-artifact runtime/ohos/process/build/re2js-unicode.mjs \
+            --esbuild-prefix "$PWD/runtime/ohos/node/build-tools" \
+            --imports-report "$ROOT/imports-report.json" \
+            --node "$ROOT/node/bin/node" \
+            --runtime-core app/ohos/entry/src/main/ets/runtime/RuntimeCore.ets \
+            --out "$ROOT/runtime-out"
+          ls -l "$ROOT/runtime-out"
+
+      - name: Download the AOT artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ohos-aot-${{ github.sha }}
+          path: ${{ env.ROOT }}/aot
+
+      - name: Package the HAP
+        run: |
+          set -euo pipefail
+          AOT="$ROOT/aot"
+          if [ ! -d "$AOT/arm64-v8a" ]; then
+            so="$(find "$ROOT/aot" -name app.so | head -1)"
+            test -n "$so"
+            AOT="$(dirname "$(dirname "$so")")"
+          fi
+          echo "AOT=$AOT"; ls -l "$AOT" "$AOT/arm64-v8a"
+          bash tooling/ohos/check-arkts.sh \
+            --sdk "$ROOT/sdk" \
+            --hms-stubs \
+            --full \
+            --aot "$AOT" \
+            --native "$ROOT/hap-libs/arm64-v8a" \
+            --runtime "$ROOT/runtime-out/dsh-runtime-rawfile.zip" \
+            --node-headers "$ROOT/src/node-v24.22.1/src" \
+            --work "$ROOT/arkts"
+          hap="$(find "$ROOT/arkts" -name 'entry-default-unsigned.hap' | head -1)"
+          test -n "$hap"
+          mkdir -p "$ROOT/out" && cp "$hap" "$ROOT/out/dsh-go-unsigned.hap"
+          ls -l "$ROOT/out"
+          cat "$ROOT/arkts/hap-audit.json" || true
+          echo "## HAP" >> "$GITHUB_STEP_SUMMARY"
+          echo "dsh-go-unsigned.hap: $(wc -c < "$ROOT/out/dsh-go-unsigned.hap") bytes" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the HAP
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-go-unsigned-hap
+          path: ${{ env.ROOT }}/out/dsh-go-unsigned.hap
+          if-no-files-found: error
+          retention-days: 14
+
+      # actions/cache only saves in a post step that runs on success (post-if: success()),
+      # so save explicitly with always(): the realistic failures happen late in the job.
+      - name: Cache readiness
+        id: cacheready
+        if: always()
+        run: |
+          if [ -f "$ROOT/node-out/build.json" ] && [ -f "$ROOT/runtimes/runtimes.json" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save node toolchain cache
+        if: always() && steps.nodecacheprobe.outputs.hit != 'true' && steps.cacheready.outputs.ok == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.ROOT }}/runtimes
+            ${{ env.ROOT }}/node-out
+          key: dsh-ohos-libnode-v1
+
+      - name: Keep the build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ${{ env.ROOT }}/arkts/*.json
+            ${{ env.ROOT }}/arkts/*.txt
+            ${{ env.ROOT }}/arkts/hvigor.log
+            ${{ env.ROOT }}/hap-libs/audit.json
+            ${{ env.ROOT }}/hap-libs-work/**/compile.log
+            ${{ env.ROOT }}/runtime-out/*.json
+            ${{ env.ROOT }}/node-out/build.json
+            ${{ env.ROOT }}/runtimes/runtimes.json
+            ${{ env.ROOT }}/prepared/*.json
+          if-no-files-found: warn
+          retention-days: 14
