@@ -144,26 +144,32 @@ jobs:
           echo "832aeb58d105de1cabc7b982dd2c65de0610f7377df48ae8fc2dd8e97420a15c  /tmp/llvm-toolchain.tar.xz" | sha256sum -c -
           tar -xJf /tmp/llvm-toolchain.tar.xz -C "$ROOT/tools"
           rm -f /tmp/llvm-toolchain.tar.xz
-          CLANG=$(find "$ROOT/tools" -maxdepth 3 -path '*/bin/clang' | head -1)
-          echo "clang=$CLANG"
-          test -x "$CLANG"
-          BIN=$(dirname "$CLANG")
-          test -x "$BIN/clang++" || { echo "::error::clang++ is not next to clang"; exit 1; }
-          # The official tarball ships bin/clang as a symlink to clang-23, and build-loader.py
-          # Path.resolve()s it: argv[0] becomes clang-23, the driver falls back to C mode,
-          # -stdlib=libc++ is dropped and no libc++ symbol reaches the link (run4 root cause).
-          # Replace it with a same-named HARD link so resolve() keeps the clang++ name.
-          REAL=$(readlink -f "$CLANG")
-          rm -f "$BIN/clang++"
+          CLANG_SYM=$(find "$ROOT/tools" -maxdepth 3 -path '*/bin/clang' | head -1)
+          echo "clang=$CLANG_SYM"
+          test -x "$CLANG_SYM"
+          BIN=$(dirname "$CLANG_SYM")
+          REAL=$(readlink -f "$CLANG_SYM")
+          test -x "$REAL"
+          # The official tarball ships bin/clang and bin/clang++ as SYMLINKS to clang-23 and
+          # build-loader.py Path.resolve()s the compiler: argv[0] would become clang-23, the
+          # driver falls back to C mode, -stdlib=libc++ is dropped and no libc++ symbol reaches
+          # the link (run4 root cause). Same-named HARD links keep the driver mode intact.
+          rm -f "$BIN/clang" "$BIN/clang++"
+          ln "$REAL" "$BIN/clang"
           ln "$REAL" "$BIN/clang++"
-          CLANG="$BIN/clang++"
-          test "$(readlink -f "$CLANG")" = "$BIN/clang++" || { echo "::error::clang++ is still a symlink"; exit 1; }
+          CLANG="$BIN/clang"
+          CLANGXX="$BIN/clang++"
+          test "$(readlink -f "$CLANG")" = "$CLANG" || { echo "::error::clang is still a symlink"; exit 1; }
+          test "$(readlink -f "$CLANGXX")" = "$CLANGXX" || { echo "::error::clang++ is still a symlink"; exit 1; }
           "$CLANG" -dumpversion | tee /tmp/clangver
           grep -qx '23.1.1' /tmp/clangver || { echo "::error::clang 23.1.1 is required"; exit 1; }
+          # build-runtimes.py passes --clang to cmake as CMAKE_C_COMPILER, so it has to be the C
+          # driver; only the C++ loader gets clang++, because there the driver mode comes from argv[0].
           printf 'int main(){return 0;}\n' > /tmp/t.cc
-          "$CLANG" --target=aarch64-linux-ohos -stdlib=libc++ -### -o /tmp/t /tmp/t.cc 2>&1 | tee /tmp/linkline
-          grep -q -- '-lc++' /tmp/linkline || echo "::warning::clang++ did not pass -lc++ to the linker; check the driver mode"
+          "$CLANGXX" --target=aarch64-linux-ohos -stdlib=libc++ -### -o /tmp/t /tmp/t.cc 2>&1 | tee /tmp/linkline
+          grep -q -- '-lc++' /tmp/linkline || echo "::warning::clang++ did not pass -lc++ to the linker"
           echo "CLANG=$CLANG" >> "$GITHUB_ENV"
+          echo "CLANGXX=$CLANGXX" >> "$GITHUB_ENV"
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
 
       - name: Host Node 24.22.1 + npm 11.9.0
@@ -282,7 +288,7 @@ jobs:
           status=0
           python3 runtime/ohos/native/build-hap-libs.py \
             --sdk-native "$ROOT/sdk/native" \
-            --clang "$CLANG" \
+            --clang "$CLANGXX" \
             --cxx-runtime "$ROOT/runtimes" \
             --libnode-output "$ROOT/node-out" \
             --node-source "$ROOT/src/node-v24.22.1" \
