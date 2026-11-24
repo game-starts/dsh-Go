@@ -202,7 +202,25 @@ jobs:
           npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/ohos/node/build-tools
           python3 runtime/tests/ohos/node-build.py --source "$ROOT/src/node-v24.22.1"
 
+      - name: Node toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ROOT }}/runtimes
+            ${{ env.ROOT }}/node-out
+          key: dsh-ohos-libnode-v1
+
+      - name: Node toolchain cache probe
+        id: nodecache
+        run: |
+          if [ -f "$ROOT/node-out/build.json" ] && [ -f "$ROOT/runtimes/runtimes.json" ]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"; echo "libnode cache HIT - skipping the rebuild"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"; echo "libnode cache MISS"
+          fi
+
       - name: LLVM runtimes for ohos (clang 23.1.1)
+        if: steps.nodecache.outputs.hit != 'true'
         run: |
           set -euo pipefail
           python3 runtime/ohos/node/build-runtimes.py \
@@ -214,6 +232,7 @@ jobs:
             --jobs 4
 
       - name: libnode.so
+        if: steps.nodecache.outputs.hit != 'true'
         run: |
           set -euo pipefail
           /usr/bin/time -v python3 runtime/ohos/node/build-node.py \
@@ -246,7 +265,8 @@ jobs:
 
       - name: Native libraries (arm64-v8a)
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          status=0
           python3 runtime/ohos/native/build-hap-libs.py \
             --sdk-native "$ROOT/sdk/native" \
             --clang "$CLANG" \
@@ -259,7 +279,19 @@ jobs:
             --sqlite-amalgamation "$ROOT/pkg/sqlite-amalgamation-3540100.zip" \
             --sqlite3-package "$ROOT/pkg/sqlite3-3.9.1" \
             --work "$ROOT/hap-libs-work" \
-            --output "$ROOT/hap-libs/arm64-v8a"
+            --output "$ROOT/hap-libs/arm64-v8a" || status=$?
+          if [ "$status" -ne 0 ]; then
+            # 子脚本把编译器 stderr 重定向进了 compile.log，失败时必须把它捞出来
+            for f in "$ROOT"/hap-libs-work/*/compile.log; do
+              [ -f "$f" ] || continue
+              echo "::group::compile.log ($f)"
+              tail -n 150 "$f"
+              echo "::endgroup::"
+            done
+            echo "=== audit.json ==="
+            cat "$ROOT/hap-libs/audit.json" || true
+            exit "$status"
+          fi
           ls -l "$ROOT/hap-libs/arm64-v8a"
           cat "$ROOT/hap-libs/audit.json" || true
 
